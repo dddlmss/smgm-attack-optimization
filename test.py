@@ -214,7 +214,10 @@ class Yolo4(object):
         # cost_function = tf.reduce_sum(hack_scores)  # 跑通代码(指定目标攻击为隐身)
         cost_function = tf.reduce_sum(self.scores)  # 跑通代码(全部目标攻击为隐身)
         print("cost_function:{}".format(cost_function))
-        gradient_function = K.gradients(cost_function, self.yolo4_model.input)[0]
+
+        # 수정 !!!
+        # 이거 아래로 옮겼어요 gradient_function = K.gradients(cost_function, self.yolo4_model.input)[0]
+        
         cost = 1
         alpha = 0.02
         n = 0
@@ -233,115 +236,158 @@ class Yolo4(object):
         D = np.zeros(image_data.shape)
         data_adv = np.zeros(image_data.shape)
         gradients_m = np.zeros(image_data.shape)
-        # 主要攻击循环
-        while cost > 0.002:
-        # for i in range(0, 10):
-            img = image_data[0]
-            img *= 255. 
-            im = Image.fromarray(img.astype(np.uint8))
-            im = letterbox_image_1(im, w, h, nw, nh)
-            im = im.resize((iw, ih), Image.BICUBIC) # 填充图像
-            # '''裁剪扰动'''
-            # if attack_name == 'SMGM-APS':
-                # im = im.convert("RGB")
-                # pixdata = im.load()
-                # for i_width in range(iw):#遍历图片的所有像素
-                    # for j_height in range(ih):
-                        # if i_width < left_min or i_width > right_max or j_height < top_min or j_height > bottom_max:
-                            # pixdata[i_width,j_height] = pixdata_1[i_width,j_height]
+
+        
+        # -------------------------
+        # Gradient-based methods
+        # -------------------------
+        if attack_name in ['I-FGSM', 'Jung', 'MI-FGSM', 'CI-FGSM', 'AO2AM', 'AI-FGSM', 'SMGM']:
+            gradient_function = K.gradients(cost_function, self.yolo4_model.input)[0]
+
+            # define missing variables used below
+            x0 = np.copy(original_image)
+            e = alpha
 
 
-            # 수정 부분!!!! 
 
-            attack_type = "untargeted"
-            save_dir = os.path.join("output", f"{attack_name.lower()}_{attack_type}")
-            os.makedirs(save_dir, exist_ok=True)
+            # 主要攻击循环
+            while cost > 0.002:
+            # for i in range(0, 10):
+                img = image_data[0]
+                img *= 255. 
+                im = Image.fromarray(img.astype(np.uint8))
+                im = letterbox_image_1(im, w, h, nw, nh)
+                im = im.resize((iw, ih), Image.BICUBIC) # 填充图像
+                # '''裁剪扰动'''
+                # if attack_name == 'SMGM-APS':
+                    # im = im.convert("RGB")
+                    # pixdata = im.load()
+                    # for i_width in range(iw):#遍历图片的所有像素
+                        # for j_height in range(ih):
+                            # if i_width < left_min or i_width > right_max or j_height < top_min or j_height > bottom_max:
+                                # pixdata[i_width,j_height] = pixdata_1[i_width,j_height]
 
-            save_path = os.path.join(save_dir, os.path.basename(jpgfile))
-            im.save(save_path)
 
-            # 再次打开图片
-            im = Image.open(save_path)
+                # 수정 부분!!!! 
 
-            # 수정 부분 끝!!
+                attack_type = "untargeted"
+                save_dir = os.path.join("output", f"{attack_name.lower()}_{attack_type}")
+                os.makedirs(save_dir, exist_ok=True)
+
+                save_path = os.path.join(save_dir, os.path.basename(jpgfile))
+                im.save(save_path)
+
+                # 再次打开图片
+                im = Image.open(save_path)
+
+                # 수정 부분 끝!!
+
+                
+                im, w, h, nw, nh, iw, ih = letterbox_image(im, tuple(reversed(model_image_size)))
+                image_data = np.array(im, dtype='float32')
+                image_data /= 255.
+                image_data = np.expand_dims(image_data, 0)
+                # 计算梯度
+                # with graph.as_default():
+                cost, gradients, out_classes, out_boxes = self.sess.run(
+                    [cost_function, gradient_function, self.classes, self.boxes],
+                    feed_dict={
+                        self.yolo4_model.input: image_data,
+                        self.input_image_shape: [image.size[1], image.size[0]],
+                        K.learning_phase(): 0
+                    })
+                print("batch:{} Cost: {:.8}".format(index, cost))
+                for i, c in reversed(list(enumerate(out_classes))):
+                    box = out_boxes[i]
+                    top, left, bottom, right = box
+                    top_list.append(top)
+                    left_list.append(left)
+                    bottom_list.append(bottom)
+                    right_list.append(right)
+                if not top_list and index == 0:
+                    top_min, left_min, bottom_max, right_max = 0, 0, 0, 0 # 初始化坐标
+                else:
+                    top_min = min(top_list)
+                    left_min = min(left_list)
+                    bottom_max = max(bottom_list)
+                    right_max = max(right_list)
 
             
-            im, w, h, nw, nh, iw, ih = letterbox_image(im, tuple(reversed(model_image_size)))
-            image_data = np.array(im, dtype='float32')
-            image_data /= 255.
-            image_data = np.expand_dims(image_data, 0)
-            # 计算梯度
-            # with graph.as_default():
-            cost, gradients, out_classes, out_boxes = self.sess.run(
-                [cost_function, gradient_function, self.classes, self.boxes],
-                feed_dict={
-                    self.yolo4_model.input: image_data,
-                    self.input_image_shape: [image.size[1], image.size[0]],
-                    K.learning_phase(): 0
-                })
-            print("batch:{} Cost: {:.8}".format(index, cost))
-            for i, c in reversed(list(enumerate(out_classes))):
-                box = out_boxes[i]
-                top, left, bottom, right = box
-                top_list.append(top)
-                left_list.append(left)
-                bottom_list.append(bottom)
-                right_list.append(right)
-            if not top_list and index == 0:
-                top_min, left_min, bottom_max, right_max = 0, 0, 0, 0 # 初始化坐标
-            else:
-                top_min = min(top_list)
-                left_min = min(left_list)
-                bottom_max = max(bottom_list)
-                right_max = max(right_list)
-            # 计算噪声
-            if attack_name == 'I-FGSM':
-                n = np.sign(gradients)
-                image_data -= n * e
-                image_data = np.clip(image_data, 0, 1.0)
-            if attack_name == 'Jung':
-                eps = 8/255.0
-                image_data = np.clip(x0 + np.random.uniform(-eps, eps, size=x0.shape), 0.0, 1.0)
-                n = np.sign(gradients)
-                image_data -= e * n
-                # 投影到 L∞ 球 & 像素裁剪
-                image_data = np.minimum(x0 + eps, np.maximum(x0 - eps, image_data))
-                image_data = np.clip(image_data, 0.0, 1.0)
-            if attack_name == 'MI-FGSM':
-                g = pre_g + gradients / np.linalg.norm(gradients, ord=1, axis=2)
-                pre_g = g
-                n = np.sign(g)
-                image_data -= n * e
-                image_data = np.clip(image_data, 0, 1.0)
-            if attack_name == 'CI-FGSM':
-                gradients = gradients - 0.5 * gradients_m
-                gradients_m = gradients_m + 0.9 *(gradients- 0.9 * gradients_m)
-                n = np.linalg.norm(gradients_m, ord=1, axis=2)
-                n = np.clip(n, max_change_below, max_change_above)
-                image_data -= n * e
-                image_data = np.clip(image_data, 0, 1.0)
-            if attack_name == 'AO2AM':
-                m = pow(gradients, 2)
-                n = gradients / ((m + 0.00000001) ** 0.5)
-                image_data -= n * e
-                image_data = np.clip(image_data, 0, 1.0)
-            if attack_name == 'AI-FGSM':
-                g = 0.1 * pre_g + 0.9 * pow(np.sign(gradients), 2)
-                pre_g = g
-                n = gradients / ((g + 0.00000001) ** 0.5)
-                image_data -= n * e
-                image_data = np.clip(image_data, 0, 1.0)
-            if attack_name == 'SMGM':
-                pre_n = np.sign(pre_g)
-                g = gradients
-                n = np.sign(g)
-                pre_g = g
-                image_data -= (pre_n * alpha + n * alpha)
-                image_data = np.clip(image_data, 0, 1.0)
-            index += 1
-            if cost < 0.002:
-                break
-        return 0
+                # 计算噪声
+                if attack_name == 'I-FGSM':
+                    n = np.sign(gradients)
+                    image_data -= n * e
+                    image_data = np.clip(image_data, 0, 1.0)
+                if attack_name == 'Jung':
+                    eps = 8/255.0
+                    image_data = np.clip(x0 + np.random.uniform(-eps, eps, size=x0.shape), 0.0, 1.0)
+                    n = np.sign(gradients)
+                    image_data -= e * n
+                    # 投影到 L∞ 球 & 像素裁剪
+                    image_data = np.minimum(x0 + eps, np.maximum(x0 - eps, image_data))
+                    image_data = np.clip(image_data, 0.0, 1.0)
+                if attack_name == 'MI-FGSM':
+                    g = pre_g + gradients / np.linalg.norm(gradients, ord=1, axis=2)
+                    pre_g = g
+                    n = np.sign(g)
+                    image_data -= n * e
+                    image_data = np.clip(image_data, 0, 1.0)
+                if attack_name == 'CI-FGSM':
+                    gradients = gradients - 0.5 * gradients_m
+                    gradients_m = gradients_m + 0.9 *(gradients- 0.9 * gradients_m)
+                    n = np.linalg.norm(gradients_m, ord=1, axis=2)
+                    n = np.clip(n, max_change_below, max_change_above)
+                    image_data -= n * e
+                    image_data = np.clip(image_data, 0, 1.0)
+                if attack_name == 'AO2AM':
+                    m = pow(gradients, 2)
+                    n = gradients / ((m + 0.00000001) ** 0.5)
+                    image_data -= n * e
+                    image_data = np.clip(image_data, 0, 1.0)
+                if attack_name == 'AI-FGSM':
+                    g = 0.1 * pre_g + 0.9 * pow(np.sign(gradients), 2)
+                    pre_g = g
+                    n = gradients / ((g + 0.00000001) ** 0.5)
+                    image_data -= n * e
+                    image_data = np.clip(image_data, 0, 1.0)
+                if attack_name == 'SMGM':
+                    pre_n = np.sign(pre_g)
+                    g = gradients
+                    n = np.sign(g)
+                    pre_g = g
+                    image_data -= (pre_n * alpha + n * alpha)
+                    image_data = np.clip(image_data, 0, 1.0)
+                index += 1
+                if cost < 0.002:
+                    break
+            
+            return 0
+    
+       # -------------------------
+        # PSO
+        # -------------------------
+        elif attack_name == 'PSO':
+            image_data = self._run_pso_attack(
+                original_image=original_image,
+                image=image,
+                cost_function=cost_function
+            )
+            return 0
+
+        # -------------------------
+        # GA
+        # -------------------------
+        elif attack_name == 'GA':
+            image_data = self._run_ga_attack(
+                original_image=original_image,
+                image=image,
+                cost_function=cost_function
+            )
+            return 0
+
+        else:
+            raise ValueError("Unsupported attack_name")
+        
 
     def TargetAttack(self, image, attack_name, count, jpgfile, model_image_size=(608, 608)):
         global graph
