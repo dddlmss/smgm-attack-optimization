@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual/conda env folders
+venv/
+env/
+.venv/
+conda_env/
+
+# Jupyter / misc
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Model weights / checkpoints
+*.h5
+*.weights
+*.ckpt
+*.pt
+*.pth
+*.onnx
+logs/
+checkpoints/
+
+# Attack outputs / generated files
+output/
+test/result/
+
+# Data files if too large
+data/
+datasets/
+
+# Temporary text artifacts
+bottlenecks.npz
