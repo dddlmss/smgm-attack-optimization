@@ -186,6 +186,185 @@ class Yolo4(object):
         end = timer()
         # print(end - start)
         return image
+    
+    # 수정 부분!! GA 추가
+
+    def _select_topk_boxes_by_score(self, out_boxes, out_scores, k=3):
+        if len(out_boxes) == 0:
+            return []
+
+        k = min(k, len(out_boxes))
+        top_idx = np.argsort(out_scores)[::-1][:k]
+        return [out_boxes[i] for i in top_idx]
+
+    
+    def _random_ga_individual(self, num_boxes, grid_size=4, eps=0.08):
+        num_vars = num_boxes * grid_size * grid_size
+        return np.random.uniform(-eps, eps, size=(num_vars,)).astype(np.float32)
+
+
+
+    def _apply_mask_from_individual(self, original_image, individual, selected_boxes, grid_size=4):
+        adv = np.copy(original_image)
+
+        if len(selected_boxes) == 0:
+            return adv
+
+        coeffs_per_box = grid_size * grid_size
+
+        for box_idx, box in enumerate(selected_boxes):
+            top, left, bottom, right = box
+
+            top = max(0, int(np.floor(top)))
+            left = max(0, int(np.floor(left)))
+            bottom = min(adv.shape[1], int(np.ceil(bottom)))
+            right = min(adv.shape[2], int(np.ceil(right)))
+
+            if bottom <= top or right <= left:
+                continue
+
+            start = box_idx * coeffs_per_box
+            end = start + coeffs_per_box
+
+            cell_coeffs = individual[start:end].reshape(grid_size, grid_size).astype(np.float32)
+
+            # upsample 4x4 mask to bbox size
+            mask_resized = cv2.resize(
+                cell_coeffs,
+                (right - left, bottom - top),
+                interpolation=cv2.INTER_LINEAR
+            )
+
+            # apply same mask to all 3 channels
+            for ch in range(3):
+                adv[0, top:bottom, left:right, ch] += mask_resized
+
+        adv = np.clip(adv, 0.0, 1.0)
+        return adv
+
+    def _evaluate_ga_individual(self, original_image, individual, image, cost_function, selected_boxes, grid_size=4):
+        adv = self._apply_mask_from_individual(original_image, individual, selected_boxes, grid_size=grid_size)
+
+        cost = self.sess.run(
+            cost_function,
+            feed_dict={
+                self.yolo4_model.input: adv,
+                self.input_image_shape: [image.size[1], image.size[0]],
+                K.learning_phase(): 0
+            }
+        )
+
+        # penalty on total perturbation magnitude
+        mag_penalty = np.mean(np.abs(individual))
+
+        fitness = -float(cost) - 0.5 * mag_penalty
+        return fitness, adv, float(cost)
+
+
+    def _tournament_select(self, population, fitnesses, k=3):
+        idxs = np.random.choice(len(population), size=k, replace=False)
+        best_idx = idxs[np.argmax([fitnesses[i] for i in idxs])]
+        return np.copy(population[best_idx])
+
+    def _crossover(self, p1, p2):
+        child1 = np.copy(p1)
+        child2 = np.copy(p2)
+
+        mask = np.random.rand(len(p1)) < 0.5
+        child1[mask] = p2[mask]
+        child2[mask] = p1[mask]
+
+        return child1, child2
+
+   
+    def _mutate(self, individual, mutation_rate=0.2, eps=0.08):
+        child = np.copy(individual)
+
+        for i in range(len(child)):
+            if np.random.rand() < mutation_rate:
+                child[i] += np.random.normal(0, 0.02)
+
+        child = np.clip(child, -eps, eps)
+        return child
+
+
+    def _run_ga_attack(self, original_image, image, cost_function, selected_boxes,
+                    pop_size=12, generations=15, elite_size=2, grid_size=4, eps=0.08):
+
+        num_boxes = len(selected_boxes)
+        if num_boxes == 0:
+            print("[GA] No selected boxes found. Returning original image.")
+            return np.copy(original_image)
+
+        population = [
+            self._random_ga_individual(num_boxes=num_boxes, grid_size=grid_size, eps=eps)
+            for _ in range(pop_size)
+        ]
+
+        best_individual = None
+        best_adv = None
+        best_fitness = -1e18
+        best_cost = 1e18
+
+        best_cost_prev = float('inf')
+        no_improve_count = 0
+
+        for gen in range(generations):
+            fitnesses = []
+
+            for individual in population:
+                fitness, adv, cost = self._evaluate_ga_individual(
+                    original_image=original_image,
+                    individual=individual,
+                    image=image,
+                    cost_function=cost_function,
+                    selected_boxes=selected_boxes,
+                    grid_size=grid_size
+                )
+
+                fitnesses.append(fitness)
+
+                if fitness > best_fitness:
+                    best_fitness = fitness
+                    best_individual = np.copy(individual)
+                    best_adv = np.copy(adv)
+                    best_cost = cost
+
+            print("[GA] generation:{} best_cost:{:.6f} best_fitness:{:.6f}".format(
+                gen, best_cost, best_fitness
+            ))
+
+            # early stopping
+            if best_cost_prev - best_cost < 1e-3:
+                no_improve_count += 1
+            else:
+                no_improve_count = 0
+
+            best_cost_prev = best_cost
+
+            if no_improve_count >= 3:
+                print("[GA] Early stopping at generation", gen)
+                break
+
+            # elitism
+            sorted_idx = np.argsort(fitnesses)[::-1]
+            new_population = [np.copy(population[i]) for i in sorted_idx[:elite_size]]
+
+            while len(new_population) < pop_size:
+                p1 = self._tournament_select(population, fitnesses)
+                p2 = self._tournament_select(population, fitnesses)
+                c1, c2 = self._crossover(p1, p2)
+                c1 = self._mutate(c1, eps=eps)
+                c2 = self._mutate(c2, eps=eps)
+                new_population.append(c1)
+                if len(new_population) < pop_size:
+                    new_population.append(c2)
+
+            population = new_population
+
+        return best_adv
+
+
 
     def Attack(self, image, attack_name, count, jpgfile, model_image_size=(608, 608)):
         # sess = K.get_session()
@@ -378,16 +557,49 @@ class Yolo4(object):
         # GA
         # -------------------------
         elif attack_name == 'GA':
+            # get detections from clean image first
+            out_boxes, out_scores, out_classes = self.sess.run(
+                [self.boxes, self.scores, self.classes],
+                feed_dict={
+                    self.yolo4_model.input: original_image,
+                    self.input_image_shape: [image.size[1], image.size[0]],
+                    K.learning_phase(): 0
+                }
+            )
+
+            TOP_K = 2
+            selected_boxes = self._select_topk_boxes_by_score(out_boxes, out_scores, k=TOP_K)
+
+            print("[GA] selected top-{} boxes by score".format(len(selected_boxes)))
+            for idx, box in enumerate(selected_boxes):
+                print("[GA] box {}: {}".format(idx, box))
+
             image_data = self._run_ga_attack(
                 original_image=original_image,
                 image=image,
-                cost_function=cost_function
+                cost_function=cost_function,
+                selected_boxes=selected_boxes,
+                pop_size=12,
+                generations=15,
+                elite_size=2,
+                grid_size=4,
+                eps=0.08
             )
-            return 0
 
-        else:
-            raise ValueError("Unsupported attack_name")
-        
+            img = image_data[0] * 255.
+            im = Image.fromarray(img.astype(np.uint8))
+            im = letterbox_image_1(im, w, h, nw, nh)
+            im = im.resize((iw, ih), Image.BICUBIC)
+
+            attack_type = "untargeted"
+            save_dir = os.path.join("output", f"{attack_name.lower()}_{attack_type}")
+            os.makedirs(save_dir, exist_ok=True)
+
+            save_path = os.path.join(save_dir, os.path.basename(jpgfile))
+            im.save(save_path)
+            print("[GA] saved:", save_path)
+
+            return 0
 
     def TargetAttack(self, image, attack_name, count, jpgfile, model_image_size=(608, 608)):
         global graph
@@ -572,8 +784,8 @@ if __name__ == '__main__':
     # -----------------------------
     # Easy switches (VERY CLEAR NOW)
     # -----------------------------
-    MODE = "attack"               # "attack" or "detect"
-    attack_name = "SMGM"          # later: "PSO"
+    MODE = "detect"               # "attack" or "detect"
+    attack_name = "GA"          # later: "PSO"
     ATTACK_TYPE = "untargeted"    # "untargeted" or "targeted"
 
     # original images
