@@ -38,3 +38,8 @@ datasets/
 
 # Temporary text artifacts
 bottlenecks.npz
+
+
+# Added
+
+results/
