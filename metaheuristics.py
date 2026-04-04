@@ -1,4 +1,3 @@
-# metaheuristics.py
 import numpy as np
 from timeit import default_timer as timer
 from keras import backend as K
@@ -9,7 +8,18 @@ class MetaheuristicAttacks:
         num_vars = num_boxes * grid_size * grid_size
         return np.random.uniform(-eps, eps, size=(num_vars,)).astype(np.float32)
 
-    def _evaluate_candidate(self, original_image, individual, image, cost_function, selected_boxes, grid_size=4):
+    def _evaluate_candidate(
+        self,
+        original_image,
+        individual,
+        image,
+        cost_function,
+        selected_boxes,
+        grid_size=4,
+        score_weight=1.0,
+        box_weight=0.3,
+        mag_weight=0.2
+    ):
         adv = self._apply_mask_from_individual(
             original_image,
             individual,
@@ -26,8 +36,18 @@ class MetaheuristicAttacks:
             }
         )
 
+        summary = self._get_detection_summary(adv, image)
+        num_boxes = summary["num_boxes"]
+        score_sum = summary["score_sum"]
+
         mag_penalty = np.mean(np.abs(individual))
-        fitness = -float(cost) - 0.5 * mag_penalty
+
+        fitness = -(
+            score_weight * float(score_sum)
+            + box_weight * float(num_boxes)
+            + mag_weight * float(mag_penalty)
+        )
+
         return fitness, adv, float(cost)
 
     # -------------------------
@@ -144,13 +164,17 @@ class MetaheuristicAttacks:
         image,
         cost_function,
         selected_boxes,
-        swarm_size=12,
-        iterations=15,
+        swarm_size=20,
+        iterations=30,
         grid_size=4,
         eps=0.08,
-        w_inertia=0.7,
-        c1=1.5,
-        c2=1.5
+        w_inertia=0.9,
+        c1=2.5,
+        c2=0.5,
+        v_max_ratio=0.2,
+        stagnation_limit=5,
+        reselect_interval=5,
+        reinit_noise_std=0.02
     ):
         num_boxes = len(selected_boxes)
         if num_boxes == 0:
@@ -158,14 +182,39 @@ class MetaheuristicAttacks:
             return np.copy(original_image), 0.0, 0.0
 
         dim = num_boxes * grid_size * grid_size
+        v_max = v_max_ratio * eps
 
-        particles = np.random.uniform(-eps, eps, size=(swarm_size, dim)).astype(np.float32)
+        # -------------------------
+        # Mixed initialization
+        # -------------------------
+        particles = np.zeros((swarm_size, dim), dtype=np.float32)
+
+        n_zero = max(1, swarm_size // 4)
+        n_gauss = max(1, swarm_size // 2)
+        n_uniform = swarm_size - n_zero - n_gauss
+
+        idx = 0
+
+        for _ in range(n_zero):
+            particles[idx] = np.random.normal(0.0, 0.005, size=dim).astype(np.float32)
+            idx += 1
+
+        for _ in range(n_gauss):
+            particles[idx] = np.random.normal(0.0, eps / 4.0, size=dim).astype(np.float32)
+            idx += 1
+
+        for _ in range(n_uniform):
+            particles[idx] = np.random.uniform(-eps, eps, size=(dim,)).astype(np.float32)
+            idx += 1
+
+        particles = np.clip(particles, -eps, eps)
         velocities = np.zeros((swarm_size, dim), dtype=np.float32)
 
         personal_best = np.copy(particles)
         personal_best_fitness = np.full((swarm_size,), -1e18, dtype=np.float32)
+        stagnation_counter = np.zeros((swarm_size,), dtype=np.int32)
 
-        global_best = None
+        global_best = np.copy(particles[0])
         global_best_fitness = -1e18
         global_best_adv = np.copy(original_image)
         global_best_cost = 1e18
@@ -175,6 +224,29 @@ class MetaheuristicAttacks:
         start_time = timer()
 
         for it in range(iterations):
+            # -------------------------
+            # Dynamic box reselection
+            # -------------------------
+            if it > 0 and (it % reselect_interval == 0):
+                summary = self._get_detection_summary(global_best_adv, image)
+
+                # Only reselect if we still have enough boxes to preserve dimension
+                if len(summary["boxes"]) >= num_boxes:
+                    selected_boxes = self._select_topk_boxes_by_score(
+                        summary["boxes"],
+                        summary["scores"],
+                        k=num_boxes
+                    )
+                    print(f"[PSO] Reselected top-{num_boxes} boxes at iter {it}")
+
+            # -------------------------
+            # Adaptive coefficients
+            # -------------------------
+            progress = it / max(1, iterations - 1)
+            w = 0.9 - 0.5 * progress      # 0.9 -> 0.4
+            c1_t = 2.5 - 1.5 * progress   # 2.5 -> 1.0
+            c2_t = 0.5 + 1.5 * progress   # 0.5 -> 2.0
+
             for i in range(swarm_size):
                 fitness, adv, cost = self._evaluate_candidate(
                     original_image=original_image,
@@ -188,6 +260,9 @@ class MetaheuristicAttacks:
                 if fitness > personal_best_fitness[i]:
                     personal_best_fitness[i] = fitness
                     personal_best[i] = np.copy(particles[i])
+                    stagnation_counter[i] = 0
+                else:
+                    stagnation_counter[i] += 1
 
                 if fitness > global_best_fitness:
                     global_best_fitness = fitness
@@ -195,28 +270,45 @@ class MetaheuristicAttacks:
                     global_best_adv = np.copy(adv)
                     global_best_cost = cost
 
-            print(f"[PSO] iter:{it} best_cost:{global_best_cost:.6f} best_fitness:{global_best_fitness:.6f}")
+            print(
+                f"[PSO] iter:{it} "
+                f"best_cost:{global_best_cost:.6f} "
+                f"best_fitness:{global_best_fitness:.6f} "
+                f"w:{w:.3f} c1:{c1_t:.3f} c2:{c2_t:.3f}"
+            )
 
-            if best_cost_prev - global_best_cost < 1e-3:
+            if best_cost_prev - global_best_cost < 1e-4:
                 no_improve_count += 1
             else:
                 no_improve_count = 0
             best_cost_prev = global_best_cost
 
-            if no_improve_count >= 3:
+            if no_improve_count >= 6:
                 print("[PSO] Early stopping at iteration", it)
                 break
 
             for i in range(swarm_size):
+                # Reinitialize stagnant particles near global best
+                if stagnation_counter[i] >= stagnation_limit:
+                    particles[i] = np.clip(
+                        global_best + np.random.normal(0, reinit_noise_std, size=dim),
+                        -eps,
+                        eps
+                    ).astype(np.float32)
+                    velocities[i] = np.zeros(dim, dtype=np.float32)
+                    stagnation_counter[i] = 0
+                    continue
+
                 r1 = np.random.rand(dim).astype(np.float32)
                 r2 = np.random.rand(dim).astype(np.float32)
 
                 velocities[i] = (
-                    w_inertia * velocities[i]
-                    + c1 * r1 * (personal_best[i] - particles[i])
-                    + c2 * r2 * (global_best - particles[i])
+                    w * velocities[i]
+                    + c1_t * r1 * (personal_best[i] - particles[i])
+                    + c2_t * r2 * (global_best - particles[i])
                 )
 
+                velocities[i] = np.clip(velocities[i], -v_max, v_max)
                 particles[i] = np.clip(particles[i] + velocities[i], -eps, eps)
 
         runtime_sec = timer() - start_time

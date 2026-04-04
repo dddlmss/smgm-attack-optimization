@@ -16,7 +16,7 @@ MODEL_IMAGE_SIZE = (608, 608)
 # Run mode
 # -----------------------------
 MODE = "detect"              # "attack" or "detect"
-ATTACK_NAME = "SMGM"          # "GA", "PSO", "DE", "SMGM"
+ATTACK_NAME = "PSO"          # "GA", "PSO", "DE", "SMGM"
 ATTACK_TYPE = "untargeted"   # "untargeted" or "targeted"
 
 # -----------------------------
@@ -33,7 +33,7 @@ CSV_PATH = os.path.join(LOG_DIR, "per_image_results.csv")
 # -----------------------------
 # Shared metaheuristic settings
 # -----------------------------
-TOP_K = 2
+TOP_K = 5
 GRID_SIZE = 4
 EPS = 0.08
 
@@ -48,11 +48,11 @@ GA_MUTATION_RATE = 0.2
 # -----------------------------
 # PSO settings
 # -----------------------------
-PSO_SWARM_SIZE = 12
-PSO_ITERATIONS = 15
-PSO_W = 0.7
-PSO_C1 = 1.5
-PSO_C2 = 1.5
+PSO_SWARM_SIZE = 20
+PSO_ITERATIONS = 30
+PSO_W = 0.9
+PSO_C1 = 2.5
+PSO_C2 = 0.5
 
 # -----------------------------
 # DE settings
