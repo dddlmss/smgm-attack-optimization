@@ -7,30 +7,25 @@ import numpy as np
 BASE_RESULTS_DIR = "results"
 OUTPUT_SUMMARY_DIR = os.path.join(BASE_RESULTS_DIR, "analysis")
 
+# Methods you want to compare in your presentation
+PRESENTATION_METHODS = {"SMGM", "PSO", "GA"}
+
 
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 
 def load_all_result_csvs(base_dir: str = BASE_RESULTS_DIR) -> pd.DataFrame:
-    """
-    Recursively find every per_image_results.csv under:
-    results/<method>/<attack_type>/logs/per_image_results.csv
-    """
     pattern = os.path.join(base_dir, "*", "*", "logs", "per_image_results.csv")
     csv_files = glob.glob(pattern)
 
     if not csv_files:
-        raise FileNotFoundError(
-            f"No result CSV files found with pattern: {pattern}"
-        )
+        raise FileNotFoundError(f"No result CSV files found with pattern: {pattern}")
 
     frames = []
     for csv_path in csv_files:
         df = pd.read_csv(csv_path)
 
-        # Infer method / attack_type from folder path if needed
-        # expected: results/method/attack_type/logs/per_image_results.csv
         parts = os.path.normpath(csv_path).split(os.sep)
         try:
             method_from_path = parts[-4]
@@ -47,14 +42,19 @@ def load_all_result_csvs(base_dir: str = BASE_RESULTS_DIR) -> pd.DataFrame:
         df["csv_path"] = csv_path
         frames.append(df)
 
-    all_results = pd.concat(frames, ignore_index=True)
-    return all_results
+    return pd.concat(frames, ignore_index=True)
 
 
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Make sure numeric columns are numeric.
-    """
+    df = df.copy()
+
+    if "method" in df.columns:
+        df["method"] = df["method"].astype(str).str.strip().str.upper()
+    if "attack_type" in df.columns:
+        df["attack_type"] = df["attack_type"].astype(str).str.strip().str.lower()
+    if "image_name" in df.columns:
+        df["image_name"] = df["image_name"].astype(str).str.strip()
+
     numeric_cols = [
         "clean_num_boxes",
         "adv_num_boxes",
@@ -78,9 +78,6 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_derived_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add a few extra useful metrics for comparison.
-    """
     df = df.copy()
 
     if {"clean_num_boxes", "adv_num_boxes"}.issubset(df.columns):
@@ -108,16 +105,30 @@ def add_derived_metrics(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def make_method_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aggregate by method and attack_type.
-    """
-    group_cols = ["method", "attack_type"]
+def deduplicate_per_image_method(df: pd.DataFrame) -> pd.DataFrame:
+    required = {"image_name", "method", "attack_type"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns for deduplication: {missing}")
 
+    ranked = df.sort_values(
+        by=["image_name", "method", "attack_type", "reduction_ratio", "score_reduction", "runtime_sec"],
+        ascending=[True, True, True, False, False, True]
+    ).copy()
+
+    dedup_df = (
+        ranked.groupby(["image_name", "method", "attack_type"], as_index=False)
+        .first()
+    )
+
+    return dedup_df
+
+
+def make_method_summary(df: pd.DataFrame) -> pd.DataFrame:
     summary = (
-        df.groupby(group_cols, dropna=False)
+        df.groupby(["method", "attack_type"], dropna=False)
         .agg(
-            num_images=("image_name", "count"),
+            num_images=("image_name", "nunique"),
             success_rate=("attack_success", "mean"),
             mean_clean_boxes=("clean_num_boxes", "mean"),
             mean_adv_boxes=("adv_num_boxes", "mean"),
@@ -144,55 +155,82 @@ def make_method_summary(df: pd.DataFrame) -> pd.DataFrame:
     return summary
 
 
-def make_per_image_comparison(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compare methods on the same image.
-    Useful for asking: which method worked best per image?
-    """
-    required = {"image_name", "method", "attack_type", "reduction_ratio", "runtime_sec", "attack_success"}
+def make_best_per_image(df: pd.DataFrame, label_prefix: str = "best") -> pd.DataFrame:
+    required = {
+        "image_name",
+        "method",
+        "attack_type",
+        "reduction_ratio",
+        "score_reduction",
+        "runtime_sec",
+        "attack_success",
+    }
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns for comparison: {missing}")
 
-    # Pick the best method per image using:
-    # 1) higher reduction_ratio
-    # 2) if tied, lower runtime
     ranked = df.sort_values(
-        by=["image_name", "attack_type", "reduction_ratio", "runtime_sec"],
-        ascending=[True, True, False, True]
+        by=["image_name", "attack_type", "reduction_ratio", "score_reduction", "runtime_sec"],
+        ascending=[True, True, False, False, True]
     )
 
-    best_per_image = ranked.groupby(["image_name", "attack_type"], as_index=False).first()
-    best_per_image = best_per_image.rename(
-        columns={
-            "method": "best_method",
-            "reduction_ratio": "best_reduction_ratio",
-            "runtime_sec": "best_runtime_sec",
-            "attack_success": "best_attack_success"
-        }
-    )
+    best_df = ranked.groupby(["image_name", "attack_type"], as_index=False).first()
 
-    return best_per_image
+    best_df = best_df.rename(columns={
+        "method": f"{label_prefix}_method",
+        "reduction_ratio": f"{label_prefix}_reduction_ratio",
+        "score_reduction": f"{label_prefix}_score_reduction",
+        "runtime_sec": f"{label_prefix}_runtime_sec",
+        "attack_success": f"{label_prefix}_attack_success",
+    })
+
+    return best_df
 
 
-def make_best_method_counts(best_per_image: pd.DataFrame) -> pd.DataFrame:
-    """
-    Count how often each method was best.
-    """
-    result = (
-        best_per_image.groupby(["attack_type", "best_method"])
+def make_best_method_counts(best_df: pd.DataFrame, method_col: str) -> pd.DataFrame:
+    return (
+        best_df.groupby(["attack_type", method_col])
         .size()
         .reset_index(name="num_best_images")
         .sort_values(by=["attack_type", "num_best_images"], ascending=[True, False])
     )
-    return result
 
 
-def print_pretty_summary(summary_df: pd.DataFrame):
-    """
-    Console-friendly printout.
-    """
-    print("\n================ METHOD SUMMARY ================\n")
+def print_duplicate_diagnostics(raw_df: pd.DataFrame, dedup_df: pd.DataFrame):
+    print("\n================ DUPLICATE DIAGNOSTICS ================\n")
+
+    raw_counts = (
+        raw_df.groupby(["method", "attack_type"])
+        .agg(
+            raw_rows=("image_name", "count"),
+            unique_images=("image_name", "nunique"),
+        )
+        .reset_index()
+    )
+
+    dedup_counts = (
+        dedup_df.groupby(["method", "attack_type"])
+        .agg(
+            dedup_rows=("image_name", "count"),
+        )
+        .reset_index()
+    )
+
+    merged = raw_counts.merge(dedup_counts, on=["method", "attack_type"], how="left")
+    merged["removed_rows"] = merged["raw_rows"] - merged["dedup_rows"]
+
+    for _, row in merged.iterrows():
+        print(
+            f"[{row['method']} | {row['attack_type']}] "
+            f"raw_rows={int(row['raw_rows'])}, "
+            f"unique_images={int(row['unique_images'])}, "
+            f"dedup_rows={int(row['dedup_rows'])}, "
+            f"removed_rows={int(row['removed_rows'])}"
+        )
+
+
+def print_pretty_summary(summary_df: pd.DataFrame, title: str):
+    print(f"\n================ {title} ================\n")
     for _, row in summary_df.iterrows():
         print(
             f"[{row['method']} | {row['attack_type']}] "
@@ -209,36 +247,64 @@ def print_pretty_summary(summary_df: pd.DataFrame):
 def main():
     ensure_dir(OUTPUT_SUMMARY_DIR)
 
-    df = load_all_result_csvs(BASE_RESULTS_DIR)
-    df = clean_dataframe(df)
-    df = add_derived_metrics(df)
+    # 1) load
+    raw_df = load_all_result_csvs(BASE_RESULTS_DIR)
+    raw_df = clean_dataframe(raw_df)
+    raw_df = add_derived_metrics(raw_df)
 
-    # Save merged raw table
-    merged_path = os.path.join(OUTPUT_SUMMARY_DIR, "all_results_merged.csv")
-    df.to_csv(merged_path, index=False)
+    raw_path = os.path.join(OUTPUT_SUMMARY_DIR, "all_results_merged.csv")
+    raw_df.to_csv(raw_path, index=False)
 
-    # Method-level summary
-    summary_df = make_method_summary(df)
+    # 2) deduplicate
+    dedup_df = deduplicate_per_image_method(raw_df)
+
+    dedup_path = os.path.join(OUTPUT_SUMMARY_DIR, "all_results_deduplicated.csv")
+    dedup_df.to_csv(dedup_path, index=False)
+
+    # 3) overall summary
+    summary_df = make_method_summary(dedup_df)
     summary_path = os.path.join(OUTPUT_SUMMARY_DIR, "method_summary.csv")
     summary_df.to_csv(summary_path, index=False)
 
-    # Per-image best method
-    best_per_image_df = make_per_image_comparison(df)
-    best_per_image_path = os.path.join(OUTPUT_SUMMARY_DIR, "best_method_per_image.csv")
-    best_per_image_df.to_csv(best_per_image_path, index=False)
+    # 4) overall best per image
+    overall_best_df = make_best_per_image(dedup_df, label_prefix="best")
+    overall_best_path = os.path.join(OUTPUT_SUMMARY_DIR, "best_method_per_image.csv")
+    overall_best_df.to_csv(overall_best_path, index=False)
 
-    # Count wins
-    best_counts_df = make_best_method_counts(best_per_image_df)
-    best_counts_path = os.path.join(OUTPUT_SUMMARY_DIR, "best_method_counts.csv")
-    best_counts_df.to_csv(best_counts_path, index=False)
+    overall_best_counts_df = make_best_method_counts(overall_best_df, "best_method")
+    overall_best_counts_path = os.path.join(OUTPUT_SUMMARY_DIR, "best_method_counts.csv")
+    overall_best_counts_df.to_csv(overall_best_counts_path, index=False)
 
-    print_pretty_summary(summary_df)
+    # 5) presentation-only summary: SMGM, PSO, GA
+    presentation_df = dedup_df[dedup_df["method"].isin(PRESENTATION_METHODS)].copy()
+
+    presentation_summary_df = make_method_summary(presentation_df)
+    presentation_summary_path = os.path.join(OUTPUT_SUMMARY_DIR, "presentation_summary.csv")
+    presentation_summary_df.to_csv(presentation_summary_path, index=False)
+
+    # 6) presentation-only best per image
+    presentation_best_df = make_best_per_image(presentation_df, label_prefix="presentation_best")
+    presentation_best_path = os.path.join(OUTPUT_SUMMARY_DIR, "best_presentation_method_per_image.csv")
+    presentation_best_df.to_csv(presentation_best_path, index=False)
+
+    presentation_best_counts_df = make_best_method_counts(presentation_best_df, "presentation_best_method")
+    presentation_best_counts_path = os.path.join(OUTPUT_SUMMARY_DIR, "best_presentation_method_counts.csv")
+    presentation_best_counts_df.to_csv(presentation_best_counts_path, index=False)
+
+    # print
+    print_duplicate_diagnostics(raw_df, dedup_df)
+    print_pretty_summary(summary_df, "METHOD SUMMARY (ALL METHODS)")
+    print_pretty_summary(presentation_summary_df, "METHOD SUMMARY (SMGM, PSO, GA)")
 
     print("\n================ FILES SAVED ================\n")
-    print(f"Merged results:      {merged_path}")
-    print(f"Method summary:      {summary_path}")
-    print(f"Best per image:      {best_per_image_path}")
-    print(f"Best method counts:  {best_counts_path}")
+    print(f"Merged raw results:                 {raw_path}")
+    print(f"Merged dedup results:               {dedup_path}")
+    print(f"Method summary:                     {summary_path}")
+    print(f"Best per image:                     {overall_best_path}")
+    print(f"Best method counts:                 {overall_best_counts_path}")
+    print(f"Presentation summary:               {presentation_summary_path}")
+    print(f"Best presentation method per image: {presentation_best_path}")
+    print(f"Best presentation method counts:    {presentation_best_counts_path}")
 
 
 if __name__ == "__main__":
