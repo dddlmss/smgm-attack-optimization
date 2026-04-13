@@ -36,5 +36,7 @@ Project Structure:
 - test.py → main entry point (attack / detect)
 - environment.yml → conda environment
 - yolo4_weight.h5 → must be downloaded separately
+
 - model_data/ → class labels and anchors
 
+" " 
